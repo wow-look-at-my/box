@@ -1,0 +1,238 @@
+#!/bin/bash
+# box: Docker-style sandboxes on macOS with no VM. Filesystems use FSKit.
+#
+#   sudo box pool N                     prepare N ready-made roots
+#   sudo box run [options] -- cmd...    run a command in a sandbox
+#   sudo box down                       unmount and remove every root
+#
+#   -v SRC:DST[:ro]   bind mount a host directory (repeatable)
+#   -w DIR            working directory inside the sandbox
+#   -e NAME=VALUE     set an environment variable (repeatable)
+#   -u USER           run as this user (default: nobody)
+#   --no-net          block all network access
+#
+# Roots are pooled: system mounts stay up between runs, because macOS keeps
+# its shared library cache mapped from them and unmounting crashes the next
+# sandbox. Bind mounts and /tmp are per run.
+set -euo pipefail
+
+BINDFS=/Users/mhaynie/.local/bin/bindfs
+OWNER=mhaynie
+OWNER_UID=501
+BASE=/Users/mhaynie/.box/slots
+MOUNT_LOCK=/Users/mhaynie/.box/mount.lock
+SYSTEM_DIRS=(/System /usr /bin /sbin /Library /opt /private/etc)
+
+die() { echo "box: $*" >&2; exit 1; }
+
+[ "$(id -u)" = 0 ] || die "must run as root"
+
+is_mounted() { mount | grep -qF " on $1 ("; }
+
+fs_mount() { # fs_mount SRC DST [ro]
+    # macFUSE's FSKit backend cannot attach virtual disks concurrently, so
+    # mounts run one at a time, across every sandbox, with a retry.
+    local attempt flags=(--create-as-mounter --chown-ignore --chgrp-ignore)
+    [ "${3:-rw}" = ro ] && flags+=(-r --perms=a-w)
+    until mkdir "$MOUNT_LOCK" 2>/dev/null; do sleep 0.1; done
+    for attempt in 1 2 3; do
+        if launchctl asuser "$OWNER_UID" sudo -u "$OWNER" "$BINDFS" \
+            "${flags[@]}" -o backend=fskit "$1" "$2" 2>/dev/null; then
+            rmdir "$MOUNT_LOCK"
+            return 0
+        fi
+        sleep 0.5
+    done
+    rmdir "$MOUNT_LOCK"
+    return 1
+}
+
+prepare_slot() { # prepare_slot ROOT
+    local root=$1 dir
+    sudo -u "$OWNER" mkdir -p "$root/private/tmp" "$root/private/var/tmp" \
+        "$root/private/var/run" "$root/Users" "$root/dev"
+    chmod 1777 "$root/private/tmp" "$root/private/var/tmp"
+    ln -sfh private/tmp "$root/tmp"
+    ln -sfh private/var "$root/var"
+    ln -sfh private/etc "$root/etc"
+    [ -e "$root/private/var/select" ] || cp -a /private/var/select "$root/private/var/"
+
+    for dir in "${SYSTEM_DIRS[@]}"; do
+        if ! is_mounted "$root$dir"; then
+            sudo -u "$OWNER" mkdir -p "$root$dir"
+            fs_mount "$dir" "$root$dir" ro || die "failed to mount $dir"
+        fi
+    done
+    is_mounted "$root/dev" || mount_devfs devfs "$root/dev"
+
+    # DNS lookups go through this socket. A hard link keeps it reachable
+    # from inside the root; --no-net still blocks it through Seatbelt.
+    ln -f /private/var/run/mDNSResponder "$root/private/var/run/mDNSResponder"
+}
+
+slot_free() { # slot_free SLOT
+    [ -d "$1/lock" ] || return 0
+    kill -0 "$(cat "$1/lock/pid" 2>/dev/null || echo 0)" 2>/dev/null && return 1
+    rm -rf "$1/lock"
+}
+
+acquire_slot() {
+    local i=0 slot
+    while :; do
+        slot=$BASE/$i
+        sudo -u "$OWNER" mkdir -p "$slot"
+        if slot_free "$slot" && mkdir "$slot/lock" 2>/dev/null; then
+            echo $$ >"$slot/lock/pid"
+            SLOT=$slot
+            return
+        fi
+        i=$((i + 1))
+    done
+}
+
+cmd_pool() {
+    local count=${1:-1} i
+    for ((i = 0; i < count; i++)); do
+        sudo -u "$OWNER" mkdir -p "$BASE/$i"
+        prepare_slot "$BASE/$i/root"
+    done
+}
+
+cmd_down() {
+    local mounted
+    mount | sed -nE "s#^.* on ($BASE/.*) \(.*#\1#p" | sort -r | while read -r mounted; do
+        umount "$mounted" || diskutil unmount force "$mounted" || true
+    done
+    # Never delete through a live mount: these point at real system folders.
+    if mount | grep -qF " on $BASE/"; then
+        die "mounts remain under $BASE; nothing was deleted"
+    fi
+    rm -rfx "$BASE"
+}
+
+cmd_run() {
+    local volumes=() envs=() workdir=/ user=nobody net=1 created=()
+    while [ $# -gt 0 ]; do
+        case $1 in
+            -v) volumes+=("$2"); shift 2 ;;
+            -w) workdir=$2; shift 2 ;;
+            -e) envs+=("$2"); shift 2 ;;
+            -u) user=$2; shift 2 ;;
+            --no-net) net=0; shift ;;
+            --) shift; break ;;
+            *) die "unknown option: $1" ;;
+        esac
+    done
+    [ $# -gt 0 ] || die "no command given"
+
+    acquire_slot
+    local root=$SLOT/root profile=$SLOT/lock/profile.sb
+
+    cleanup() {
+        local dst
+        if [ ${#created[@]} -gt 0 ]; then
+            for dst in "${created[@]}"; do
+                umount "$dst" 2>/dev/null || umount -f "$dst" 2>/dev/null || true
+                rmdir "$dst" 2>/dev/null || true
+            done
+        fi
+        find "$root/private/tmp" "$root/private/var/tmp" -mindepth 1 -delete 2>/dev/null || true
+        rm -rf "$SLOT/lock"
+    }
+    trap cleanup EXIT
+
+    prepare_slot "$root"
+
+    local volume src dst mode
+    if [ ${#volumes[@]} -gt 0 ]; then
+        for volume in "${volumes[@]}"; do
+            IFS=: read -r src dst mode <<<"$volume"
+            [ -d "$src" ] || die "no such directory: $src"
+            case $dst in
+                /*) ;;
+                *) die "destination must be absolute: $volume" ;;
+            esac
+            sudo -u "$OWNER" mkdir -p "$root$dst"
+            created+=("$root$dst")
+            fs_mount "$src" "$root$dst" "${mode:-rw}" || die "failed to mount $dst"
+        done
+    fi
+
+    # The chroot isolates the filesystem view, Seatbelt covers the rest.
+    {
+        echo '(version 1)'
+        echo '(allow default)'
+        echo '(deny process-info* (target others))'
+        echo '(deny signal (target others))'
+        echo '(deny file-read* file-write* (regex #"/dev/r?disk"))'
+        [ "$net" = 1 ] || echo '(deny network*)'
+
+        # Writes are denied unless listed here.
+        echo '(deny file-write*)'
+        echo "(allow file-write* (subpath \"$root/private/tmp\"))"
+        echo "(allow file-write* (subpath \"$root/private/var/tmp\"))"
+        echo "(allow file-write* (subpath \"$root/dev\"))"
+        echo '(deny file-read* file-write* (regex #"/dev/r?disk"))'
+        if [ ${#volumes[@]} -gt 0 ]; then
+            for volume in "${volumes[@]}"; do
+                IFS=: read -r src dst mode <<<"$volume"
+                [ "${mode:-rw}" = ro ] || echo "(allow file-write* (subpath \"$root$dst\"))"
+            done
+        fi
+
+        # The /System bind mount also exposes every APFS volume on the Mac.
+        # Only Preboot is needed, because it holds the shared library cache.
+        echo '(deny file-read* file-write*'
+        echo "    (subpath \"$root/System/Volumes/Data\")"
+        echo "    (subpath \"$root/System/Volumes/Hardware\")"
+        echo "    (subpath \"$root/System/Volumes/iSCPreboot\")"
+        echo "    (subpath \"$root/System/Volumes/Update\")"
+        echo "    (subpath \"$root/System/Volumes/VM\")"
+        echo "    (subpath \"$root/System/Volumes/xarts\"))"
+
+        # System services are denied unless listed here. This is what keeps
+        # the clipboard, launchd and Apple Events out of reach.
+        echo '(deny mach-lookup)'
+        echo '(allow mach-lookup (global-name
+            "com.apple.system.notification_center"
+            "com.apple.system.opendirectoryd.libinfo"
+            "com.apple.system.opendirectoryd.membership"
+            "com.apple.system.logger"
+            "com.apple.logd"
+            "com.apple.diagnosticd"
+            "com.apple.cfprefsd.daemon"
+            "com.apple.SystemConfiguration.configd"
+            "com.apple.SystemConfiguration.DNSConfiguration"
+            "com.apple.dnssd.service"
+            "com.apple.trustd"
+            "com.apple.trustd.agent"
+            "com.apple.SecurityServer"))'
+    } >"$profile"
+
+    cat >"$root/private/tmp/.box-start" <<'EOF'
+#!/bin/sh
+cd "$BOX_WORKDIR" || exit 125
+unset BOX_WORKDIR
+exec "$@"
+EOF
+    chmod 755 "$root/private/tmp/.box-start"
+
+    local env_args=(HOME=/tmp PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin "BOX_WORKDIR=$workdir")
+    [ ${#envs[@]} -eq 0 ] || env_args+=("${envs[@]}")
+
+    local status
+    set +e
+    /usr/bin/env -i "${env_args[@]}" /usr/bin/sandbox-exec -f "$profile" \
+        /usr/sbin/chroot -u "$(id -u "$user")" -g "$(id -g "$user")" "$root" \
+        /tmp/.box-start "$@"
+    status=$?
+    set -e
+    exit $status
+}
+
+case ${1:-} in
+    run) shift; cmd_run "$@" ;;
+    pool) shift; cmd_pool "$@" ;;
+    down) cmd_down ;;
+    *) die "usage: box run|pool|down" ;;
+esac
